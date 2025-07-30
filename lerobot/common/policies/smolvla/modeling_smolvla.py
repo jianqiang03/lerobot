@@ -75,6 +75,8 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from lerobot.common.utils.utils import get_safe_dtype
+import threading
+import time
 
 # Matches ".soNNN", optionally followed by "-something", up to the "_buffer_" marker
 _VARIANT_RE = re.compile(r"\.so\d+(?:-[\w]+)?_buffer_")
@@ -355,6 +357,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         self.language_tokenizer = AutoProcessor.from_pretrained(self.config.vlm_model_name).tokenizer
         self.model = VLAFlowMatching(config)
+        self.infer_thread = threading.Thread(target=self.infer_loop, daemon=True)
+        self._lock = threading.Lock()
+        self.infer_thread.start()
         self.reset()
 
     def reset(self):
@@ -362,6 +367,52 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._should_run_infer = False
+        self._is_initialized = False
+        self._last_action = None
+        self._observation = None
+        self._noise = None
+
+    def infer_loop(self):
+            """后台线程：监听并运行推理任务"""
+            while True:
+                with self._lock:
+                    should_run = self._should_run_infer
+                    obs = self._observation
+                    noise = self._noise
+
+                if should_run and obs is not None and noise is not None:
+                    with torch.no_grad():
+                        start_time = time.perf_counter()
+                        images, img_masks = self.prepare_images(obs)
+                        state = self.prepare_state(obs)
+                        lang_tokens, lang_masks = self.prepare_language(obs)
+
+                        actions = self.model.sample_actions(
+                            images, img_masks, lang_tokens, lang_masks, state, noise=noise
+                        )
+                        actions = actions[:, :, :self.config.action_feature.shape[0]]
+                        actions = self.unnormalize_outputs({"action": actions})["action"]
+
+                        if self.config.adapt_to_pi_aloha:
+                            actions = self._pi_aloha_encode_actions(actions)
+
+                        end_time = time.perf_counter()
+                        inference_time = end_time - start_time
+                        print(f"Inference took {inference_time:.4f} seconds")
+
+                        drop_count = int(inference_time * 1000 // 30)
+                        actions = actions.transpose(0, 1)
+
+                        while drop_count > 0 and len(actions) > 0:
+                            actions = actions[1:]
+                            drop_count -= 1
+
+                        with self._lock:
+                            self._queues[ACTION].extend(actions)
+                            self._should_run_infer = False
+                else:
+                    time.sleep(0.001)  # 🌙 空转时降低CPU负载
 
     # HACK(aliberts, danaaubakirova): we overwrite this classmethod here to fix smolVLA-specific issues
     @classmethod
@@ -385,46 +436,49 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Select a single action given environment observations.
-
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
-        queue is empty.
-        """
         self.eval()
-
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
 
         batch = self.normalize_inputs(batch)
+        with self._lock:
+            self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._queues[ACTION]) == 0:
+        if not self._is_initialized:
             for k in batch:
                 if k in self._queues:
                     batch[k] = torch.stack(list(self._queues[k]), dim=1)
             images, img_masks = self.prepare_images(batch)
             state = self.prepare_state(batch)
             lang_tokens, lang_masks = self.prepare_language(batch)
-
             actions = self.model.sample_actions(
                 images, img_masks, lang_tokens, lang_masks, state, noise=noise
             )
-            # Unpad actions
-            original_action_dim = self.config.action_feature.shape[0]
-            actions = actions[:, :, :original_action_dim]
-
+            actions = actions[:, :, :self.config.action_feature.shape[0]]
             actions = self.unnormalize_outputs({"action": actions})["action"]
 
             if self.config.adapt_to_pi_aloha:
                 actions = self._pi_aloha_encode_actions(actions)
 
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
-        return self._queues[ACTION].popleft()
+            self._is_initialized = True
+        elif len(self._queues[ACTION]) == 0:
+                print(f"[WARNING] Fallback triggered due to inference error")
+                if self._last_action is not None:
+                    return self._last_action
+                else:
+                    return torch.zeros((batch[OBS_STATE].shape[0], self.config.action_feature.shape[0]),
+                                       device=batch[OBS_STATE].device)
+        elif len(self._queues[ACTION]) <= 25:
+            with self._lock:
+                self._observation = batch
+                self._noise = noise
+                self._should_run_infer = True
+        
+        with self._lock:
+            action = self._queues[ACTION].popleft()
+            self._last_action = action
+        return action
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss"""
